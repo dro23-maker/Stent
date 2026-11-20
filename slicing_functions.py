@@ -920,18 +920,29 @@ def all_5_axis_calculations(mesh, printSettings, slicingDirections):
         minAcceptableBedToNozzleClearance = 12.0
         paths_3D = []
         for layer, path2D in enumerate(meshSections): # Turn 2D paths into 3D paths to make global Z values known
+            # Empty / missed slices (thin walls, plane misses) yield None — skip them.
+            if path2D is None:
+                continue
             currentTransform = transform3DList[layer]
+            if currentTransform is None or (isinstance(currentTransform, np.ndarray) and currentTransform.size == 0):
+                continue
             paths_3D.append(path2D.to_3D(currentTransform))
+
+        if not paths_3D:
+            return stopSlicing
             
         sectionPoints = [path.vertices for path in paths_3D]
         sectionZValuesBySlicePlane = [[point[2] for point in section] for section in sectionPoints]
 
         for layer, section in enumerate(sectionZValuesBySlicePlane):
             theta = directionsRad[chunk][0]
+            sin_theta = np.sin(theta)
+            if abs(sin_theta) < 1e-9:
+                continue
             for z in section:
                 if stopSlicing == False:
                     if z <= minAcceptableBedToNozzleClearance: # Only calculate currentBedToNozzleDistance if this point's z value is less than minAcceptableBedToNozzleClearance
-                        currentBedToNozzleDistance = abs(z)/np.sin(theta) # We want this to be larger than 12.0 mm
+                        currentBedToNozzleDistance = abs(z)/sin_theta # We want this to be larger than 12.0 mm
                         if currentBedToNozzleDistance < minAcceptableBedToNozzleClearance: # Invalid Point (Collision detected between bed and nozzle)
                             stopSlicing = True
         return stopSlicing
@@ -1189,20 +1200,35 @@ def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions,
 
         for layer_idx, (paths, transform) in enumerate(zip(layer_paths, transformation_matrices)):
             layerPaths = []
+            layer_z = None
             # Handle each path in the current layer
             for path in paths:
-                
+                if path is None:
+                    continue
                 # Get 2D coordinates from the path
                 coords_2d = np.array(path.coords)
+                if coords_2d.size == 0:
+                    continue
 
                 # Transform each point in the path
                 coords_3d = np.array([transform_point(point, transform) for point in coords_2d])
                 
                 printable_coords_3d = np.array([np.matmul(DCM_AB, point3D) for point3D in coords_3d])
+                if printable_coords_3d.size == 0:
+                    continue
 
                 layerPaths.append([(point[0], point[1]) for point in printable_coords_3d])
+                if layer_z is None:
+                    layer_z = float(printable_coords_3d[0][2])
             printable_pathPoints.append(layerPaths)
-            midLayer_Z_Heights.append(printable_coords_3d[0][2])
+            if layer_z is None:
+                # Empty layer (thin wall / fully offset-away shells): fall back to transform origin Z.
+                if isinstance(transform, np.ndarray) and transform.shape == (4, 4):
+                    origin = np.array([transform[0, 3], transform[1, 3], transform[2, 3]])
+                    layer_z = float(np.matmul(DCM_AB, origin)[2])
+                else:
+                    layer_z = 0.0
+            midLayer_Z_Heights.append(layer_z)
 
         return printable_pathPoints, midLayer_Z_Heights
 
@@ -1217,14 +1243,19 @@ def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions,
             layerPaths = []
             # Handle each path in the current layer
             for line in paths:
-                
+                if line is None or len(line) == 0 or line[0] is None:
+                    continue
                 # Get 2D coordinates from the line
                 coords_2d = np.array(line[0].coords)
+                if coords_2d.size == 0:
+                    continue
 
                 # Transform each point in the line
                 coords_3d = np.array([transform_point(point, transform) for point in coords_2d])
                 
                 printable_coords_3d = np.array([np.matmul(DCM_AB, point3D) for point3D in coords_3d])
+                if printable_coords_3d.size == 0:
+                    continue
 
                 layerPaths.append([(point[0], point[1]) for point in printable_coords_3d])
             printable_pathPoints.append(layerPaths)
@@ -1341,6 +1372,9 @@ def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions,
     global E, previousE
     E = 0  # Cumulative length of 1.75mm diameter filament used at every line of G-Code
     previousE = 0
+    # Safe default so empty-chunk / empty-layer exports still write a valid footer
+    # (avoids UnboundLocalError on nozzleHeight when nothing extruded).
+    nozzleHeight = 30.0
 
     for key in chunk_transform3DList: # For each chunk
         openFile.write(";" + "Chunk " + key + "\n")
@@ -1348,6 +1382,11 @@ def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions,
         shellRingsListList = chunk_shellRingsListList[key]
         optimizedSolidInfills = chunk_optimizedSolidInfills[key]
         optimizedInternalInfills = chunk_optimizedInternalInfills[key]
+
+        # Guard missing chunk data (e.g. collision abort mid-slice)
+        if shellRingsListList is None or transform3DList is None:
+            openFile.write("; Skipping chunk " + key + " (no toolpath data)\n")
+            continue
 
         theta = BMOVE_Degrees[int(key)]*(np.pi/180.0)
         phi = AMOVE_Degrees[int(key)]*(np.pi/180.0)
@@ -1402,13 +1441,13 @@ def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions,
 
             current3DTransform = transform3DList[k]
 
-            if current3DTransform.shape == (4, 4):  # If there is something to print at this layer, do so. Otherwise, there is a vertical gap underneath a floating island in which G-Code shouldn't be generated
+            if isinstance(current3DTransform, np.ndarray) and current3DTransform.shape == (4, 4):  # If there is something to print at this layer, do so. Otherwise, there is a vertical gap underneath a floating island in which G-Code shouldn't be generated
                 nozzleHeight = midLayer_Z_Heights[k] + 0.5 * layerHeight # Current height of nozzle
 
                 """ Z COMMAND """
                 openFile.write("G0 F" + str(G0Z_FEEDRATE) + " Z" + str(round(nozzleHeight, 5)) + "\n")
 
-                if key == '0' and k == 0 and adhesionList[0] != []: # If it's layer zero of the initial chunk and there is adhesion gcode (brims, skirts) to write, do so
+                if key == '0' and k == 0 and adhesionList and adhesionList[0] != []: # If it's layer zero of the initial chunk and there is adhesion gcode (brims, skirts) to write, do so
                     """ ADHESION FEATURE TITLE """
                     if enableBrim == True:
                         openFile.write(";" + "Brim" + "\n")
@@ -1434,6 +1473,8 @@ def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions,
 
                     runOnce = True  # True if this is the start of a new feature on this layer (feature means shells, infill, etc.)
                     for shell in shells:  # G0 commands are written between each path on the same layer
+                        if not shell:
+                            continue
                         pathPoints = shell
                         
                         """ XYE COMMANDS """
@@ -1449,6 +1490,8 @@ def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions,
 
                     runOnce = True
                     for solidInfill in solidInfills:
+                        if not solidInfill:
+                            continue
                         pathPoints = solidInfill
 
                         """ XYE COMMANDS """
@@ -1464,6 +1507,8 @@ def write_5_axis_gcode(newFile, savedFileName, printSettings, startingPositions,
 
                     runOnce = True
                     for internalInfill in internalInfills:
+                        if not internalInfill:
+                            continue
                         pathPoints = internalInfill
 
                         """ XYE COMMANDS """
